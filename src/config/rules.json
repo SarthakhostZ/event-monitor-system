@@ -1,0 +1,121 @@
+{
+  "rules": [
+    {
+      "id": "critical-event-type",
+      "description": "Any event submitted with type=critical is immediately escalated",
+      "priority": 1,
+      "condition": {
+        "field": "type",
+        "operator": "equals",
+        "value": "critical"
+      },
+      "action": {
+        "setSeverity": "critical",
+        "triggerAlert": true
+      }
+    },
+    {
+      "id": "high-error-rate",
+      "description": "Error events reporting a count above 50 indicate a high error rate",
+      "priority": 2,
+      "condition": {
+        "field": "type",
+        "operator": "equals",
+        "value": "error",
+        "and": {
+          "field": "metadata.count",
+          "operator": "greaterThan",
+          "value": 50
+        }
+      },
+      "action": {
+        "setSeverity": "high",
+        "triggerAlert": true
+      }
+    },
+    {
+      "id": "payment-failure",
+      "description": "Error events in the payment category require immediate attention",
+      "priority": 3,
+      "condition": {
+        "field": "type",
+        "operator": "equals",
+        "value": "error",
+        "and": {
+          "field": "metadata.category",
+          "operator": "equals",
+          "value": "payment"
+        }
+      },
+      "action": {
+        "setSeverity": "high",
+        "triggerAlert": true
+      }
+    },
+    {
+      "id": "payment-failure-title",
+      "description": "Catch payment failures signalled via title when metadata.category is absent",
+      "priority": 4,
+      "condition": {
+        "field": "title",
+        "operator": "contains",
+        "value": "payment",
+        "and": {
+          "field": "type",
+          "operator": "equals",
+          "value": "error"
+        }
+      },
+      "action": {
+        "setSeverity": "high",
+        "triggerAlert": true
+      }
+    },
+    {
+      "id": "api-high-latency",
+      "description": "API latency above 5 000 ms degrades user experience",
+      "priority": 5,
+      "condition": {
+        "field": "metadata.latencyMs",
+        "operator": "greaterThan",
+        "value": 5000
+      },
+      "action": {
+        "setSeverity": "medium",
+        "triggerAlert": false
+      }
+    },
+    {
+      "id": "signup-spike",
+      "description": "User signup volume more than 200 % above baseline may indicate abuse or a viral event",
+      "priority": 6,
+      "condition": {
+        "field": "metadata.signupSpike",
+        "operator": "greaterThan",
+        "value": 200
+      },
+      "action": {
+        "setSeverity": "medium",
+        "triggerAlert": false
+      }
+    },
+    {
+      "id": "info-event",
+      "description": "Plain informational events are low severity and do not require alerting",
+      "priority": 7,
+      "condition": {
+        "field": "type",
+        "operator": "equals",
+        "value": "info"
+      },
+      "action": {
+        "setSeverity": "low",
+        "triggerAlert": false
+      }
+    }
+  ],
+  "defaults": {
+    "severity": "medium",
+    "triggerAlert": false
+  }
+}

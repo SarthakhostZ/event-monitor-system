@@ -1,0 +1,613 @@
+service: event-monitor-system
+
+frameworkVersion: '4'
+
+useDotenv: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLUGINS
+# ─────────────────────────────────────────────────────────────────────────────
+plugins:
+  - serverless-offline
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM
+# ─────────────────────────────────────────────────────────────────────────────
+custom:
+  # Table / queue / topic names  (stage-scoped to avoid collisions)
+  eventsTable:   ${self:service}-events-${self:provider.stage}
+  usersTable:    ${self:service}-users-${self:provider.stage}
+  alertsTable:   ${self:service}-alerts-${self:provider.stage}
+  metricsTable:  ${self:service}-metrics-${self:provider.stage}
+  sqsQueueName:  ${self:service}-EventProcessingQueue-${self:provider.stage}
+  dlqName:       ${self:service}-EventProcessingDLQ-${self:provider.stage}
+  snsTopicName:  CriticalAlerts-${self:provider.stage}
+  s3BucketName:  ${self:service}-event-archival-${self:provider.stage}-${aws:accountId}
+
+  # Stage-specific toggles
+  aiEnabled:
+    dev:     'false'
+    staging: 'true'
+    prod:    'true'
+
+  # DynamoDB billing mode
+  dynamoMode:
+    dev:     PAY_PER_REQUEST
+    staging: PAY_PER_REQUEST
+    prod:    PROVISIONED
+
+  # Memory sizes (right-sized by role)
+  memoryIngest:    128
+  memoryProcessor: 256
+  memoryAnalyzer:  256
+  memoryDispatch:  128
+  memoryDashboard: 128
+  memoryHealth:    128
+
+  # serverless-offline settings
+  serverless-offline:
+    httpPort: 3000
+    lambdaPort: 3002
+    noPrependStageInUrl: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVIDER
+# ─────────────────────────────────────────────────────────────────────────────
+provider:
+  name: aws
+  runtime: nodejs20.x
+  stage: ${opt:stage, 'dev'}
+  region: ${env:AWS_REGION, 'us-east-1'}
+  logRetentionInDays: 14
+  timeout: 29         # API Gateway hard limit is 29s; non-HTTP functions override below
+
+  # Shared environment variables — injected into every Lambda
+  environment:
+    NODE_ENV:                  ${self:provider.stage}
+    STAGE:                     ${self:provider.stage}
+    LOG_LEVEL:                 ${env:LOG_LEVEL, 'info'}
+
+    # DynamoDB
+    DYNAMODB_EVENTS_TABLE:     ${self:custom.eventsTable}
+    DYNAMODB_ALERTS_TABLE:     ${self:custom.alertsTable}
+    DYNAMODB_METRICS_TABLE:    ${self:custom.metricsTable}
+
+    # SQS / SNS (resolved at deploy time via CloudFormation refs)
+    SQS_QUEUE_URL:             !Ref EventProcessingQueue
+    SNS_TOPIC_ARN:             !Ref CriticalAlertsTopic
+
+    # S3
+    S3_ARCHIVAL_BUCKET:        ${self:custom.s3BucketName}
+
+    # Auth
+    JWT_SECRET:                ${env:JWT_SECRET}
+    JWT_ISSUER:                ${env:JWT_ISSUER, 'event-monitor-system'}
+    JWT_AUDIENCE:              ${env:JWT_AUDIENCE, 'event-monitor-api'}
+    JWT_EXPIRY:                ${env:JWT_EXPIRY, '1h'}
+
+    # OpenAI
+    OPENAI_API_KEY:            ${env:OPENAI_API_KEY, ''}
+    OPENAI_MODEL:              ${env:OPENAI_MODEL, 'gpt-4o-mini'}
+    AI_ENABLED:                ${self:custom.aiEnabled.${self:provider.stage}}
+    AI_MAX_RETRIES:            ${env:AI_MAX_RETRIES, '3'}
+    AI_CIRCUIT_BREAKER_THRESHOLD:  ${env:AI_CIRCUIT_BREAKER_THRESHOLD, '5'}
+    AI_CIRCUIT_BREAKER_TIMEOUT_MS: ${env:AI_CIRCUIT_BREAKER_TIMEOUT_MS, '300000'}
+
+    # Email
+    SMTP_HOST:                 ${env:SMTP_HOST, ''}
+    SMTP_PORT:                 ${env:SMTP_PORT, '587'}
+    SMTP_USER:                 ${env:SMTP_USER, ''}
+    SMTP_PASS:                 ${env:SMTP_PASS, ''}
+    ALERT_EMAIL_TO:            ${env:ALERT_EMAIL_TO, ''}
+
+    # Slack
+    SLACK_WEBHOOK_URL:         ${env:SLACK_WEBHOOK_URL, ''}
+
+    # Application
+    RATE_LIMIT_DEFAULT:        ${env:RATE_LIMIT_DEFAULT, '100'}
+    EVENT_TTL_DAYS:            ${env:EVENT_TTL_DAYS, '30'}
+
+  # ── IAM — Least-privilege per resource ──────────────────────────────────────
+  iam:
+    role:
+      statements:
+        # ── EventsTable ──
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+          Resource:
+            - !GetAtt EventsTable.Arn
+            - !Sub '${EventsTable.Arn}/index/*'   # GSIs
+
+        # ── AlertsTable ──
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+          Resource:
+            - !GetAtt AlertsTable.Arn
+
+        # ── MetricsTable ──
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+          Resource:
+            - !GetAtt MetricsTable.Arn
+
+        # ── RateLimiter bucket reads (EventsTable re-used for token counters) ──
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource:
+            - !GetAtt EventsTable.Arn
+
+        # ── SQS — ingest Lambdas send; processor consumes ──
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource:
+            - !GetAtt EventProcessingQueue.Arn
+
+        - Effect: Allow
+          Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - !GetAtt EventProcessingQueue.Arn
+
+        # ── SNS — analyzer publishes; dispatcher needs no publish ──
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource:
+            - !Ref CriticalAlertsTopic
+
+        # ── DynamoDB Streams — eventAnalyzer reads stream ──
+        - Effect: Allow
+          Action:
+            - dynamodb:GetRecords
+            - dynamodb:GetShardIterator
+            - dynamodb:DescribeStream
+            - dynamodb:ListStreams
+          Resource:
+            - !GetAtt EventsTable.StreamArn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAMBDA FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+functions:
+
+  # ── 0. api — Express catch-all for /api/v1/* (auth, events, alerts) ────────
+  # Handles all REST API routes called by the frontend dashboard.
+  api:
+    handler: src/handlers/api.handler
+    memorySize: 128
+    description: 'ANY /api/v1/* — Express app: auth, events, alerts routes'
+    events:
+      - http:
+          path: /api/v1/{proxy+}
+          method: any
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - Authorization
+              - X-Api-Key
+            allowCredentials: false
+      - http:
+          path: /api/v1
+          method: any
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - Authorization
+              - X-Api-Key
+            allowCredentials: false
+
+  # ── 1. eventIngest ─────────────────────────────────────────────────────────
+  # Receives, validates, and enqueues new events. Returns 202 immediately.
+  eventIngest:
+    handler: src/handlers/eventIngest.handler
+    memorySize: ${self:custom.memoryIngest}
+    description: 'POST /events — validate & enqueue incoming events'
+    events:
+      - http:
+          path: /events
+          method: POST
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - Authorization
+              - X-Api-Key
+            allowCredentials: false
+
+  # ── 2. webhookReceiver ─────────────────────────────────────────────────────
+  # Receives external webhooks (GitHub, Stripe, PagerDuty, generic).
+  # Verifies source-specific HMAC signatures before processing.
+  webhookReceiver:
+    handler: src/handlers/webhookReceiver.handler
+    memorySize: ${self:custom.memoryIngest}
+    description: 'POST /webhook/{source} — HMAC-verified external webhooks'
+    events:
+      - http:
+          path: /webhook/{source}
+          method: POST
+          cors:
+            origin: '*'
+            headers:
+              - Content-Type
+              - X-Hub-Signature-256
+              - X-Webhook-Secret
+              - Stripe-Signature
+          request:
+            parameters:
+              paths:
+                source: true
+
+  # ── 3. eventProcessor ─────────────────────────────────────────────────────
+  # Pulls events from SQS in batches of 10, runs rule engine classification,
+  # and writes to DynamoDB with idempotency guards.
+  eventProcessor:
+    handler: src/handlers/eventProcessor.handler
+    memorySize: ${self:custom.memoryProcessor}
+    timeout: 60              # SQS consumer needs more than API timeout
+    description: 'SQS consumer — rule engine classification & DynamoDB write'
+    events:
+      - sqs:
+          arn: !GetAtt EventProcessingQueue.Arn
+          batchSize: 10
+          maximumBatchingWindow: 5         # wait up to 5s to fill a batch
+          functionResponseType: ReportBatchItemFailures  # partial-batch retries
+
+  # ── 4. eventAnalyzer ──────────────────────────────────────────────────────
+  # Triggered by DynamoDB Streams on EventsTable (INSERT only).
+  # Calls OpenAI to generate AI summary, severity, and recommendation.
+  # Skips events already classified as low by the rule engine.
+  eventAnalyzer:
+    handler: src/handlers/eventAnalyzer.handler
+    memorySize: ${self:custom.memoryAnalyzer}
+    timeout: 120             # OpenAI calls can be slow under load
+    description: 'DynamoDB Streams — AI analysis via OpenAI gpt-4o-mini'
+    events:
+      - stream:
+          type: dynamodb
+          arn: !GetAtt EventsTable.StreamArn
+          batchSize: 5
+          maximumRetryAttempts: 2
+          bisectBatchOnFunctionError: true
+          startingPosition: TRIM_HORIZON
+
+  # ── 5. alertDispatcher ────────────────────────────────────────────────────
+  # Triggered by SNS CriticalAlerts topic.
+  # Routes alerts to email, Slack, and/or SMS based on severity.
+  # Writes delivery result to AlertsTable.
+  alertDispatcher:
+    handler: src/handlers/alertDispatcher.handler
+    memorySize: ${self:custom.memoryDispatch}
+    timeout: 60
+    description: 'SNS trigger — fan-out alerts to email, Slack, SMS'
+    events:
+      - sns:
+          arn: !Ref CriticalAlertsTopic
+          topicName: ${self:custom.snsTopicName}
+
+  # ── 6. getEvents ──────────────────────────────────────────────────────────
+  # List events with filters (severity, source, type, status, date range).
+  # Paginated via DynamoDB LastEvaluatedKey / nextToken.
+  getEvents:
+    handler: src/handlers/dashboardAPI.handler
+    memorySize: ${self:custom.memoryDashboard}
+    description: 'GET /events — list & filter events (viewer+)'
+    events:
+      - http:
+          path: /events
+          method: GET
+          cors: true
+      - http:
+          path: /events/{eventId}
+          method: GET
+          cors: true
+          request:
+            parameters:
+              paths:
+                eventId: true
+
+  # ── 7. getDashboard ───────────────────────────────────────────────────────
+  # Aggregate stats, trends, and cost metrics for the dashboard.
+  getDashboard:
+    handler: src/handlers/dashboardAPI.handler
+    memorySize: ${self:custom.memoryDashboard}
+    description: 'GET /dashboard/* — stats, trends, cost metrics'
+    events:
+      - http:
+          path: /dashboard/stats
+          method: GET
+          cors: true
+      - http:
+          path: /dashboard/trends
+          method: GET
+          cors: true
+      - http:
+          path: /metrics/cost
+          method: GET
+          cors: true
+
+  # ── 8. healthCheck ────────────────────────────────────────────────────────
+  # Public health endpoint — no auth required.
+  # Pings DynamoDB, SQS, and SNS to confirm connectivity.
+  healthCheck:
+    handler: src/handlers/health.check
+    memorySize: ${self:custom.memoryHealth}
+    description: 'GET /health — public system health check'
+    events:
+      - http:
+          path: /health
+          method: GET
+          cors: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLOUDFORMATION RESOURCES
+# ─────────────────────────────────────────────────────────────────────────────
+resources:
+  Resources:
+
+    # ── DynamoDB: EventsTable ──────────────────────────────────────────────
+    EventsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Delete          # never accidentally drop prod data
+      Properties:
+        TableName: ${self:custom.eventsTable}
+        BillingMode: ${self:custom.dynamoMode.${self:provider.stage}}
+
+        # Attribute definitions — only indexed attributes go here
+        AttributeDefinitions:
+          - AttributeName: eventId
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+          - AttributeName: severity
+            AttributeType: S
+          - AttributeName: source
+            AttributeType: S
+
+        # Primary key
+        KeySchema:
+          - AttributeName: eventId
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+
+        # GSI: query events by severity (dashboard)
+        GlobalSecondaryIndexes:
+          - IndexName: severity-index
+            KeySchema:
+              - AttributeName: severity
+                KeyType: HASH
+              - AttributeName: timestamp
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+          # GSI: query events by source (webhook analytics)
+          - IndexName: source-index
+            KeySchema:
+              - AttributeName: source
+                KeyType: HASH
+              - AttributeName: timestamp
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+        # TTL: auto-expire events after EVENT_TTL_DAYS days
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+        # Streams: triggers eventAnalyzer Lambda
+        StreamSpecification:
+          StreamViewType: NEW_IMAGE
+
+        # Point-in-time recovery for prod safety
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── DynamoDB: UsersTable ──────────────────────────────────────────────
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Delete
+      Properties:
+        TableName: ${self:custom.usersTable}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: email-index
+            KeySchema:
+              - AttributeName: email
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── DynamoDB: AlertsTable ──────────────────────────────────────────────
+    AlertsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Delete
+      Properties:
+        TableName: ${self:custom.alertsTable}
+        BillingMode: PAY_PER_REQUEST    # alerts volume is always low
+
+        AttributeDefinitions:
+          - AttributeName: alertId
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+
+        KeySchema:
+          - AttributeName: alertId
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── DynamoDB: MetricsTable ─────────────────────────────────────────────
+    MetricsTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Delete
+      Properties:
+        TableName: ${self:custom.metricsTable}
+        BillingMode: PAY_PER_REQUEST
+
+        AttributeDefinitions:
+          - AttributeName: metricKey
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+
+        KeySchema:
+          - AttributeName: metricKey
+            KeyType: HASH
+          - AttributeName: timestamp
+            KeyType: RANGE
+
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── SQS: Dead Letter Queue (must be created before the main queue) ─────
+    EventProcessingDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.dlqName}
+        MessageRetentionPeriod: 1209600   # 14 days — preserve for investigation
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── SQS: Main Processing Queue ─────────────────────────────────────────
+    EventProcessingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.sqsQueueName}
+        VisibilityTimeout: 360            # 6× Lambda timeout (60s) per SQS best practice
+        MessageRetentionPeriod: 345600    # 4 days
+        ReceiveMessageWaitTimeSeconds: 20 # long polling — reduces empty receives
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt EventProcessingDLQ.Arn
+          maxReceiveCount: 3              # 3 failures → DLQ
+
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── SNS: CriticalAlerts Topic ──────────────────────────────────────────
+    CriticalAlertsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:custom.snsTopicName}
+        DisplayName: 'Event Monitor Critical Alerts'
+        Tags:
+          - Key: Project
+            Value: ${self:service}
+          - Key: Stage
+            Value: ${self:provider.stage}
+
+    # ── SNS: Email subscription (ops team) ────────────────────────────────
+    # Subscription must be confirmed via email after first deploy.
+    CriticalAlertsEmailSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref CriticalAlertsTopic
+        Protocol: email
+        Endpoint: ${env:ALERT_EMAIL_TO, 'ops-team@example.com'}
+
+  # ── CloudFormation Outputs ───────────────────────────────────────────────
+  Outputs:
+    EventsTableName:
+      Value: !Ref EventsTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-EventsTable
+
+    EventsTableStreamArn:
+      Value: !GetAtt EventsTable.StreamArn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-EventsTableStreamArn
+
+    AlertsTableName:
+      Value: !Ref AlertsTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-AlertsTable
+
+    MetricsTableName:
+      Value: !Ref MetricsTable
+      Export:
+        Name: ${self:service}-${self:provider.stage}-MetricsTable
+
+    EventProcessingQueueUrl:
+      Value: !Ref EventProcessingQueue
+      Export:
+        Name: ${self:service}-${self:provider.stage}-SQSQueueUrl
+
+    EventProcessingQueueArn:
+      Value: !GetAtt EventProcessingQueue.Arn
+      Export:
+        Name: ${self:service}-${self:provider.stage}-SQSQueueArn
+
+    DeadLetterQueueUrl:
+      Value: !Ref EventProcessingDLQ
+      Export:
+        Name: ${self:service}-${self:provider.stage}-DLQUrl
+
+    CriticalAlertsTopicArn:
+      Value: !Ref CriticalAlertsTopic
+      Export:
+        Name: ${self:service}-${self:provider.stage}-SNSTopicArn
+
+

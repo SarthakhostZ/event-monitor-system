@@ -1,0 +1,68 @@
+{
+  "name": "event-monitor-system",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "jest --coverage",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test:load": "node tests/load/events.load.js",
+    "lint": "npx eslint src/ --ext .js",
+    "deploy": "npx serverless deploy",
+    "deploy:dev": "npx serverless deploy --stage dev",
+    "deploy:staging": "npx serverless deploy --stage staging",
+    "deploy:prod": "npx serverless deploy --stage prod",
+    "logs": "npx serverless logs -f api -t"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageDirectory": "coverage",
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/handlers/dashboardAPI.js",
+      "!src/handlers/webhookReceiver.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "lines": 80
+      }
+    },
+    "moduleNameMapper": {
+      "^uuid$": "<rootDir>/__mocks__/uuid.js"
+    }
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1028.0",
+    "@aws-sdk/client-sns": "^3.1028.0",
+    "@aws-sdk/client-sqs": "^3.1029.0",
+    "@aws-sdk/lib-dynamodb": "^3.1028.0",
+    "aws-sdk": "^2.1693.0",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^16.6.1",
+    "express": "^5.2.1",
+    "joi": "^18.1.2",
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^8.0.5",
+    "openai": "^6.34.0",
+    "serverless-http": "^4.0.0",
+    "uuid": "^13.0.0",
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "serverless": "^4.0.0",
+    "serverless-offline": "^14.0.0",
+    "supertest": "^7.2.2"
+  }
+}
